@@ -119,55 +119,58 @@ export const Sidebar = ({
     setSearchPerformed(true);
     
     try {
-      // Check if input looks like a UUID - 36 characters with dashes
       const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(searchInput);
       
       let targetProfile = null;
-      let profileError = null;
       
       if (isUUID) {
-        // First try searching by user_id
-        const result1 = await supabase
+        // Try searching by user_id first
+        const { data: d1 } = await supabase
           .from("profiles")
           .select("id, username, user_id")
           .eq("user_id", searchInput)
-          .maybeSingle();
+          .limit(1);
         
-        if (result1.data) {
-          targetProfile = result1.data;
-          profileError = result1.error;
+        if (d1 && d1.length > 0) {
+          targetProfile = d1[0];
         } else {
-          // If not found by user_id, try by profile id
-          const result2 = await supabase
+          // Try by profile id
+          const { data: d2 } = await supabase
             .from("profiles")
             .select("id, username, user_id")
             .eq("id", searchInput)
-            .maybeSingle();
-          targetProfile = result2.data;
-          profileError = result2.error;
+            .limit(1);
+          if (d2 && d2.length > 0) {
+            targetProfile = d2[0];
+          }
         }
-      } else {
-        // Search by exact username first (case-insensitive)
-        const result = await supabase
+      }
+      
+      // If not found by UUID or input is not UUID, search by username
+      if (!targetProfile) {
+        // Try exact match first
+        const { data: d3 } = await supabase
           .from("profiles")
           .select("id, username, user_id")
-          .ilike("username", searchInput)
-          .maybeSingle();
-        targetProfile = result.data;
-        profileError = result.error;
+          .eq("username", searchInput)
+          .limit(1);
+        
+        if (d3 && d3.length > 0) {
+          targetProfile = d3[0];
+        } else {
+          // Try case-insensitive match
+          const { data: d4 } = await supabase
+            .from("profiles")
+            .select("id, username, user_id")
+            .ilike("username", searchInput)
+            .limit(1);
+          if (d4 && d4.length > 0) {
+            targetProfile = d4[0];
+          }
+        }
       }
       
-      if (profileError) {
-        toast({
-          variant: "destructive",
-          title: "Lỗi",
-          description: "Có lỗi xảy ra khi tìm kiếm"
-        });
-        setIsSearching(false);
-        return;
-      }
-      
-      // Check if searching for self by user_id
+      // Check if searching for self
       if (targetProfile && targetProfile.user_id === currentUser.id) {
         toast({
           variant: "destructive",
@@ -184,7 +187,8 @@ export const Sidebar = ({
       } else {
         setSearchResult(targetProfile);
       }
-    } catch {
+    } catch (err) {
+      console.error("Search error:", err);
       toast({
         variant: "destructive",
         title: "Lỗi",
