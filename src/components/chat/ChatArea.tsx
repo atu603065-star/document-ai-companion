@@ -4,6 +4,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { useNotificationSound } from "@/hooks/useNotificationSound";
 import { useVoiceCall } from "@/hooks/useVoiceCall";
+import { useSignalProtocol } from "@/hooks/useSignalProtocol";
 import { useE2EEncryption } from "@/hooks/useE2EEncryption";
 import { sanitizeInput, isAllowedFileType } from "@/lib/security";
 import { isEncryptedMessage } from "@/lib/encryption";
@@ -14,6 +15,7 @@ import { Progress } from "@/components/ui/progress";
 import { Conversation } from "@/pages/Chat";
 import { MessageContextMenu } from "./MessageContextMenu";
 import { ConversationMenu } from "./ConversationMenu";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 import { MessageBubble } from "./MessageBubble";
 import { StorageModal } from "./StorageModal";
@@ -40,6 +42,9 @@ import {
   Archive,
   Upload,
   FolderOpen,
+  Fingerprint,
+  Copy,
+  Check,
 } from "lucide-react";
 
 interface Message {
@@ -128,31 +133,51 @@ export const ChatArea = ({
   const [storageOpen, setStorageOpen] = useState(false);
   const [storageSelectMode, setStorageSelectMode] = useState(false);
   const [e2eEnabled, setE2eEnabled] = useState(true); // E2E encryption enabled by default
+  const [safetyNumberOpen, setSafetyNumberOpen] = useState(false);
+  const [safetyNumberCopied, setSafetyNumberCopied] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { toast } = useToast();
   const { playSound } = useNotificationSound(currentUser.id);
   
-  // E2E Encryption hook
+  // Signal Protocol hook (primary encryption)
+  const {
+    isReady: isSignalReady,
+    isInitializing: isSignalInitializing,
+    encrypt: signalEncrypt,
+    decrypt: signalDecrypt,
+    safetyNumber,
+    isSignalMessage,
+  } = useSignalProtocol({
+    userId: currentUser.id,
+    conversationId: conversation.id,
+    remoteUserId: conversation.participant.user_id,
+    enabled: e2eEnabled,
+  });
+
+  // Legacy E2E Encryption hook (backward compatibility for old messages)
   const {
     isSupported: isE2ESupported,
     isEnabled: isE2EActive,
     isReady: isE2EReady,
-    encryptMessage,
-    decryptMessage,
+    encryptMessage: legacyEncrypt,
+    decryptMessage: legacyDecrypt,
     initializeEncryption,
   } = useE2EEncryption({
     conversationId: conversation.id,
     enabled: e2eEnabled,
   });
   
-  // Initialize encryption when conversation opens
+  // Initialize legacy encryption for backward compatibility
   useEffect(() => {
     if (e2eEnabled && isE2ESupported && !isE2EReady) {
       initializeEncryption();
     }
   }, [e2eEnabled, isE2ESupported, isE2EReady, initializeEncryption]);
+
+  // Combined encryption state
+  const isEncryptionActive = e2eEnabled && (isSignalReady || isE2EActive);
   // Use voice call props from parent if available, otherwise use local hook
   const localVoiceCall = useVoiceCall(voiceCallProps ? undefined : currentUser.id);
   
@@ -425,10 +450,14 @@ export const ChatArea = ({
     setSelectedFile(null);
     setReplyTo(null);
 
-    // Encrypt message if E2E is enabled
-    if (messageContent && isE2EActive) {
+    // Encrypt message - prefer Signal Protocol, fallback to legacy
+    if (messageContent && isEncryptionActive) {
       try {
-        messageContent = await encryptMessage(messageContent);
+        if (isSignalReady) {
+          messageContent = await signalEncrypt(messageContent);
+        } else if (isE2EActive) {
+          messageContent = await legacyEncrypt(messageContent);
+        }
       } catch (err) {
         console.error("Failed to encrypt message:", err);
         toast({
@@ -741,18 +770,30 @@ export const ChatArea = ({
 
   // Decrypt messages when they change or encryption becomes ready
   useEffect(() => {
-    const decryptMessages = async () => {
-      if (!isE2EActive) return;
+    const decryptAllMessages = async () => {
+      if (!isEncryptionActive) return;
       
       const newDecrypted: Record<string, string> = {};
       
       for (const msg of visibleMessages) {
-        if (msg.content && isEncryptedMessage(msg.content)) {
-          try {
-            const decrypted = await decryptMessage(msg.content);
-            newDecrypted[msg.id] = decrypted;
-          } catch {
-            newDecrypted[msg.id] = '[Không thể giải mã]';
+        if (msg.content) {
+          // Try Signal Protocol first
+          if (isSignalReady && isSignalMessage(msg.content)) {
+            try {
+              const decrypted = await signalDecrypt(msg.content);
+              newDecrypted[msg.id] = decrypted;
+            } catch {
+              newDecrypted[msg.id] = '[Không thể giải mã]';
+            }
+          }
+          // Fallback to legacy E2E encryption
+          else if (isE2EActive && isEncryptedMessage(msg.content)) {
+            try {
+              const decrypted = await legacyDecrypt(msg.content);
+              newDecrypted[msg.id] = decrypted;
+            } catch {
+              newDecrypted[msg.id] = '[Không thể giải mã]';
+            }
           }
         }
       }
@@ -760,16 +801,16 @@ export const ChatArea = ({
       setDecryptedContents(prev => ({ ...prev, ...newDecrypted }));
     };
 
-    decryptMessages();
-  }, [visibleMessages.length, isE2EActive, decryptMessage]);
+    decryptAllMessages();
+  }, [visibleMessages.length, isEncryptionActive, isSignalReady, isE2EActive, signalDecrypt, legacyDecrypt, isSignalMessage]);
 
   // Get display content for a message (decrypted if available)
   const getDisplayContent = useCallback((msg: Message): string | null => {
     if (!msg.content) return null;
     if (decryptedContents[msg.id]) return decryptedContents[msg.id];
-    if (isEncryptedMessage(msg.content)) return '[Đang giải mã...]';
+    if (isSignalMessage(msg.content) || isEncryptedMessage(msg.content)) return '[Đang giải mã...]';
     return msg.content;
-  }, [decryptedContents]);
+  }, [decryptedContents, isSignalMessage]);
   return (
     <div className="flex-1 flex flex-col bg-background h-full">
       {/* Header */}
@@ -802,23 +843,36 @@ export const ChatArea = ({
             <p className="font-medium text-foreground">
               {conversation.participant.username}
             </p>
-            <button 
-              onClick={() => setE2eEnabled(!e2eEnabled)}
-              className="text-xs flex items-center gap-1 hover:opacity-80 transition-opacity"
-              title={isE2EActive ? "Nhấn để tắt mã hóa E2E" : "Nhấn để bật mã hóa E2E"}
-            >
-              {isE2EActive ? (
-                <>
-                  <Lock className="w-3 h-3 text-primary" />
-                  <span className="text-primary">E2E đã bật</span>
-                </>
-              ) : (
-                <>
-                  <LockOpen className="w-3 h-3 text-muted-foreground" />
-                  <span className="text-muted-foreground">E2E đang tắt</span>
-                </>
+            <div className="flex items-center gap-2">
+              <button 
+                onClick={() => setE2eEnabled(!e2eEnabled)}
+                className="text-xs flex items-center gap-1 hover:opacity-80 transition-opacity"
+                title={isEncryptionActive ? "Nhấn để tắt mã hóa E2E" : "Nhấn để bật mã hóa E2E"}
+              >
+                {isEncryptionActive ? (
+                  <>
+                    <Lock className="w-3 h-3 text-primary" />
+                    <span className="text-primary">
+                      {isSignalReady ? "Signal" : "E2E"}{isSignalInitializing ? " ..." : " đã bật"}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <LockOpen className="w-3 h-3 text-muted-foreground" />
+                    <span className="text-muted-foreground">E2E đang tắt</span>
+                  </>
+                )}
+              </button>
+              {isSignalReady && safetyNumber && (
+                <button
+                  onClick={() => setSafetyNumberOpen(true)}
+                  className="text-xs flex items-center gap-1 text-muted-foreground hover:text-primary transition-colors"
+                  title="Xem Safety Number"
+                >
+                  <Fingerprint className="w-3 h-3" />
+                </button>
               )}
-            </button>
+            </div>
           </div>
         </div>
         <div className="flex items-center gap-1">
@@ -1109,6 +1163,50 @@ export const ChatArea = ({
         onEnd={endCall}
         onToggleMute={toggleMute}
       />
+
+      {/* Safety Number Dialog */}
+      <Dialog open={safetyNumberOpen} onOpenChange={setSafetyNumberOpen}>
+        <DialogContent className="bg-card border-border max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-foreground">
+              <Fingerprint className="w-5 h-5 text-primary" />
+              Safety Number
+            </DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              So sánh số này với {conversation.participant.username} để xác minh mã hóa đầu cuối.
+            </p>
+            <div className="font-mono text-center text-lg tracking-[0.3em] leading-relaxed p-4 bg-muted rounded-lg break-all select-all text-foreground">
+              {safetyNumber.match(/.{1,5}/g)?.join(' ') || safetyNumber}
+            </div>
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={() => {
+                navigator.clipboard.writeText(safetyNumber);
+                setSafetyNumberCopied(true);
+                setTimeout(() => setSafetyNumberCopied(false), 2000);
+              }}
+            >
+              {safetyNumberCopied ? (
+                <>
+                  <Check className="w-4 h-4 mr-2" />
+                  Đã sao chép
+                </>
+              ) : (
+                <>
+                  <Copy className="w-4 h-4 mr-2" />
+                  Sao chép
+                </>
+              )}
+            </Button>
+            <p className="text-xs text-muted-foreground text-center">
+              Nếu số này khớp với đối phương, cuộc trò chuyện được mã hóa an toàn.
+            </p>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };
