@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Block zoom on mobile -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <!-- Prevent zooming on double-tap -->
+    <meta name="HandheldFriendly" content="true" />
+    <title>Whisper Shield</title>
+    <meta name="description" content="Secure messaging app" />
+    <meta name="author" content="Lovable" />
+
+    <meta property="og:title" content="Whisper Shield" />
+    <meta property="og:description" content="Secure messaging app" />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="https://lovable.dev/opengraph-image-p98pqg.png" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@Lovable" />
+    <meta name="twitter:image" content="https://lovable.dev/opengraph-image-p98pqg.png" />
+    
+    <!-- Prevent mobile browser from exiting on back -->
+    <style>
+      /* Prevent zoom on double-tap and pinch */
+      html {
+        touch-action: manipulation;
+      }
+      body {
+        touch-action: pan-x pan-y;
+        overscroll-behavior: none;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      /* Allow text selection in input fields */
+      input, textarea {
+        -webkit-user-select: text;
+        user-select: text;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
