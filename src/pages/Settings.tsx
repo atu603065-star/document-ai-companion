@@ -9,6 +9,7 @@ import { useSecurePIN } from "@/hooks/useSecurePIN";
 import { useDeviceEncryption } from "@/hooks/useDeviceEncryption";
 import { validatePinFormat } from "@/lib/security";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import {
   ArrowLeft,

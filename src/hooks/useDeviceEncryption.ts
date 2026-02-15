@@ -7,8 +7,14 @@ const DB_VERSION = 1;
 const STORE_NAME = 'keys';
 
 interface DeviceKeyPair {
-  publicKey: string;
-  privateKey: string;
+  publicKey: string; // JWK JSON string
+  privateKey: CryptoKey; // Non-extractable CryptoKey
+  fingerprint: string;
+}
+
+interface StoredKeyData {
+  publicKeyJwk: JsonWebKey;
+  privateKeyJwk: JsonWebKey; // We store JWK but import as non-extractable
   fingerprint: string;
 }
 
@@ -22,7 +28,18 @@ export interface DeviceInfo {
   last_active: string;
 }
 
-// --- IndexedDB helpers for private key storage ---
+// Encrypted message structure stored in device_encrypted_content JSONB
+export interface DeviceEncryptedPayload {
+  v: 1; // version
+  device_id: string; // UUID of the device that can decrypt
+  device_fingerprint: string;
+  ciphertext: string; // base64 AES-GCM encrypted content
+  iv: string; // base64 IV
+  encrypted_aes_key: string; // base64 AES key encrypted with device's ECDH-derived key
+  sender_device_id: string;
+}
+
+// --- IndexedDB helpers ---
 
 function openKeyDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -38,7 +55,7 @@ function openKeyDB(): Promise<IDBDatabase> {
   });
 }
 
-async function getStoredKeys(): Promise<DeviceKeyPair | null> {
+async function getStoredKeyData(): Promise<StoredKeyData | null> {
   try {
     const db = await openKeyDB();
     return new Promise((resolve, reject) => {
@@ -54,12 +71,12 @@ async function getStoredKeys(): Promise<DeviceKeyPair | null> {
   }
 }
 
-async function storeKeys(keys: DeviceKeyPair): Promise<void> {
+async function storeKeyData(data: StoredKeyData): Promise<void> {
   const db = await openKeyDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
-    store.put({ id: 'device-keys', data: keys });
+    store.put({ id: 'device-keys', data });
     tx.oncomplete = () => { db.close(); resolve(); };
     tx.onerror = () => { db.close(); reject(tx.error); };
   });
@@ -80,7 +97,7 @@ async function clearStoredKeys(): Promise<void> {
   }
 }
 
-// --- Crypto helpers using Web Crypto API ---
+// --- Crypto helpers ---
 
 function ab2b64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
@@ -100,99 +117,176 @@ function b642ab(base64: string): ArrayBuffer {
   return bytes.buffer as ArrayBuffer;
 }
 
-async function generateDeviceKeyPair(): Promise<DeviceKeyPair> {
-  // Generate ECDH P-256 key pair for key exchange
+async function generateDeviceKeys(): Promise<{ stored: StoredKeyData; privateKey: CryptoKey }> {
+  // Generate ECDH P-256 key pair
   const keyPair = await crypto.subtle.generateKey(
     { name: 'ECDH', namedCurve: 'P-256' },
-    true,
-    ['deriveKey', 'deriveBits']
+    true, // extractable for initial storage only
+    ['deriveBits']
   );
 
   const publicKeyJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
   const privateKeyJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
 
-  const publicKeyStr = JSON.stringify(publicKeyJwk);
-  const privateKeyStr = JSON.stringify(privateKeyJwk);
-
   // Generate fingerprint from public key
-  const pubKeyBuffer = new TextEncoder().encode(publicKeyStr);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
+  const pubKeyStr = JSON.stringify(publicKeyJwk);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pubKeyStr));
   const fingerprint = ab2b64(hashBuffer).substring(0, 16);
 
+  // Import private key as non-extractable for runtime use
+  const nonExtractablePrivateKey = await crypto.subtle.importKey(
+    'jwk', privateKeyJwk,
+    { name: 'ECDH', namedCurve: 'P-256' },
+    false, // NON-EXTRACTABLE
+    ['deriveBits']
+  );
+
   return {
-    publicKey: publicKeyStr,
-    privateKey: privateKeyStr,
-    fingerprint,
+    stored: { publicKeyJwk, privateKeyJwk, fingerprint },
+    privateKey: nonExtractablePrivateKey,
   };
 }
 
-async function deriveAESKey(privateKeyJwk: JsonWebKey, publicKeyJwk: JsonWebKey): Promise<CryptoKey> {
-  const privateKey = await crypto.subtle.importKey(
-    'jwk', privateKeyJwk,
+async function importPrivateKey(jwk: JsonWebKey): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'jwk', jwk,
     { name: 'ECDH', namedCurve: 'P-256' },
-    false, ['deriveBits']
+    false, // NON-EXTRACTABLE
+    ['deriveBits']
   );
-  const publicKey = await crypto.subtle.importKey(
-    'jwk', publicKeyJwk,
-    { name: 'ECDH', namedCurve: 'P-256' },
-    false, []
-  );
+}
 
+async function importPublicKey(jwk: JsonWebKey): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'jwk', jwk,
+    { name: 'ECDH', namedCurve: 'P-256' },
+    false,
+    []
+  );
+}
+
+// Derive AES key from ECDH shared secret
+async function deriveAESFromECDH(privateKey: CryptoKey, publicKeyJwk: JsonWebKey): Promise<CryptoKey> {
+  const publicKey = await importPublicKey(publicKeyJwk);
   const sharedBits = await crypto.subtle.deriveBits(
     { name: 'ECDH', public: publicKey },
     privateKey,
     256
   );
-
   return crypto.subtle.importKey(
     'raw', sharedBits,
     { name: 'AES-GCM', length: 256 },
-    false, ['encrypt', 'decrypt']
+    false,
+    ['encrypt', 'decrypt']
   );
 }
 
-export async function encryptWithDeviceKey(message: string, privateKeyStr: string, publicKeyStr: string): Promise<string> {
-  const privateKeyJwk = JSON.parse(privateKeyStr) as JsonWebKey;
-  const publicKeyJwk = JSON.parse(publicKeyStr) as JsonWebKey;
+// --- Encryption/Decryption ---
 
-  const aesKey = await deriveAESKey(privateKeyJwk, publicKeyJwk);
+/**
+ * Encrypt a message for a specific device.
+ * Flow:
+ * 1. Generate random AES-256-GCM key for the message
+ * 2. Encrypt message content with the random AES key
+ * 3. Derive a wrapping key from ECDH(sender_private, device_public)
+ * 4. Encrypt the random AES key with the wrapping key
+ * 5. Return the payload
+ */
+export async function encryptForDevice(
+  message: string,
+  senderPrivateKey: CryptoKey,
+  devicePublicKeyJwk: JsonWebKey,
+  deviceId: string,
+  deviceFingerprint: string,
+  senderDeviceId: string,
+): Promise<DeviceEncryptedPayload> {
+  // 1. Generate random AES key for message
+  const messageKey = await crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    true, // extractable so we can wrap it
+    ['encrypt', 'decrypt']
+  );
+
+  // 2. Encrypt message content
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encoded = new TextEncoder().encode(message);
-
   const ciphertext = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
-    aesKey, encoded
+    messageKey,
+    encoded
   );
 
-  // Format: base64(iv) + '.' + base64(ciphertext)
-  return `DE:${ab2b64(iv.buffer as ArrayBuffer)}.${ab2b64(ciphertext)}`;
+  // 3. Derive wrapping key from ECDH
+  const wrappingKey = await deriveAESFromECDH(senderPrivateKey, devicePublicKeyJwk);
+
+  // 4. Export and encrypt the message key
+  const rawMessageKey = await crypto.subtle.exportKey('raw', messageKey);
+  const keyIv = crypto.getRandomValues(new Uint8Array(12));
+  const encryptedKey = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: keyIv },
+    wrappingKey,
+    rawMessageKey
+  );
+
+  // Combine keyIv + encryptedKey for storage
+  const combinedKey = new Uint8Array(keyIv.length + new Uint8Array(encryptedKey).length);
+  combinedKey.set(keyIv);
+  combinedKey.set(new Uint8Array(encryptedKey), keyIv.length);
+
+  return {
+    v: 1,
+    device_id: deviceId,
+    device_fingerprint: deviceFingerprint,
+    ciphertext: ab2b64(ciphertext),
+    iv: ab2b64(iv.buffer as ArrayBuffer),
+    encrypted_aes_key: ab2b64(combinedKey.buffer as ArrayBuffer),
+    sender_device_id: senderDeviceId,
+  };
 }
 
-export async function decryptWithDeviceKey(encrypted: string, privateKeyStr: string, publicKeyStr: string): Promise<string> {
-  if (!encrypted.startsWith('DE:')) {
-    return encrypted; // Not device-encrypted
-  }
+/**
+ * Decrypt a device-encrypted message.
+ * The current device must have the matching private key.
+ */
+export async function decryptDeviceMessage(
+  payload: DeviceEncryptedPayload,
+  devicePrivateKey: CryptoKey,
+  senderPublicKeyJwk: JsonWebKey,
+): Promise<string> {
+  // 1. Derive wrapping key from ECDH(my_private, sender_public)
+  const wrappingKey = await deriveAESFromECDH(devicePrivateKey, senderPublicKeyJwk);
 
-  const payload = encrypted.slice(3);
-  const [ivB64, ciphertextB64] = payload.split('.');
+  // 2. Split keyIv + encryptedKey
+  const combinedKeyBuf = b642ab(payload.encrypted_aes_key);
+  const combinedArr = new Uint8Array(combinedKeyBuf);
+  const keyIv = combinedArr.slice(0, 12);
+  const encryptedKeyData = combinedArr.slice(12);
 
-  const privateKeyJwk = JSON.parse(privateKeyStr) as JsonWebKey;
-  const publicKeyJwk = JSON.parse(publicKeyStr) as JsonWebKey;
+  // 3. Decrypt the AES message key
+  const rawMessageKey = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: keyIv },
+    wrappingKey,
+    encryptedKeyData
+  );
 
-  const aesKey = await deriveAESKey(privateKeyJwk, publicKeyJwk);
-  const iv = new Uint8Array(b642ab(ivB64));
-  const ciphertext = b642ab(ciphertextB64);
+  // 4. Import the message key
+  const messageKey = await crypto.subtle.importKey(
+    'raw', rawMessageKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['decrypt']
+  );
 
+  // 5. Decrypt the message
+  const iv = new Uint8Array(b642ab(payload.iv));
+  const ciphertext = b642ab(payload.ciphertext);
   const decrypted = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv },
-    aesKey, ciphertext
+    messageKey,
+    ciphertext
   );
 
   return new TextDecoder().decode(decrypted);
-}
-
-export function isDeviceEncrypted(message: string): boolean {
-  return message.startsWith('DE:');
 }
 
 // --- Device name detection ---
@@ -216,40 +310,44 @@ export function useDeviceEncryption(userId: string | undefined) {
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [keys, setKeys] = useState<DeviceKeyPair | null>(null);
+  const [privateKey, setPrivateKey] = useState<CryptoKey | null>(null);
+  const [publicKeyJwk, setPublicKeyJwk] = useState<JsonWebKey | null>(null);
+  const [fingerprint, setFingerprint] = useState<string | null>(null);
 
-  // Check if device encryption is active
   const checkStatus = useCallback(async () => {
     if (!userId) { setLoading(false); return; }
 
     try {
-      const storedKeys = await getStoredKeys();
-      if (storedKeys) {
-        setKeys(storedKeys);
+      const storedData = await getStoredKeyData();
+      if (storedData) {
+        // Import private key as non-extractable
+        const privKey = await importPrivateKey(storedData.privateKeyJwk);
+        setPrivateKey(privKey);
+        setPublicKeyJwk(storedData.publicKeyJwk);
+        setFingerprint(storedData.fingerprint);
 
         // Check if this device is registered in DB
         const { data } = await supabase
-          .from('user_devices' as any)
+          .from('user_devices')
           .select('*')
           .eq('user_id', userId)
-          .eq('device_fingerprint', storedKeys.fingerprint)
+          .eq('device_fingerprint', storedData.fingerprint)
           .eq('is_active', true)
           .maybeSingle();
 
         if (data) {
           setIsEnabled(true);
           setIsReady(true);
-          setCurrentDeviceId((data as any).id);
+          setCurrentDeviceId(data.id);
 
           // Update last_active
           await supabase
-            .from('user_devices' as any)
-            .update({ last_active: new Date().toISOString() } as any)
-            .eq('id', (data as any).id);
+            .from('user_devices')
+            .update({ last_active: new Date().toISOString() })
+            .eq('id', data.id);
         }
       }
 
-      // Fetch all devices
       await fetchDevices();
     } catch (err) {
       console.error('Device encryption check failed:', err);
@@ -261,7 +359,7 @@ export function useDeviceEncryption(userId: string | undefined) {
   const fetchDevices = useCallback(async () => {
     if (!userId) return;
     const { data } = await supabase
-      .from('user_devices' as any)
+      .from('user_devices')
       .select('*')
       .eq('user_id', userId)
       .eq('is_active', true)
@@ -276,32 +374,33 @@ export function useDeviceEncryption(userId: string | undefined) {
     checkStatus();
   }, [checkStatus]);
 
-  // Enable device encryption
   const enableEncryption = useCallback(async () => {
     if (!userId) return false;
 
     try {
-      const keyPair = await generateDeviceKeyPair();
-      await storeKeys(keyPair);
+      const { stored, privateKey: privKey } = await generateDeviceKeys();
+      await storeKeyData(stored);
 
       const { data, error } = await supabase
-        .from('user_devices' as any)
+        .from('user_devices')
         .insert({
           user_id: userId,
           device_name: getDeviceName(),
-          public_key: keyPair.publicKey,
-          device_fingerprint: keyPair.fingerprint,
+          public_key: JSON.stringify(stored.publicKeyJwk),
+          device_fingerprint: stored.fingerprint,
           is_active: true,
-        } as any)
+        })
         .select()
         .single();
 
       if (error) throw error;
 
-      setKeys(keyPair);
+      setPrivateKey(privKey);
+      setPublicKeyJwk(stored.publicKeyJwk);
+      setFingerprint(stored.fingerprint);
       setIsEnabled(true);
       setIsReady(true);
-      setCurrentDeviceId((data as any).id);
+      setCurrentDeviceId(data.id);
       await fetchDevices();
       return true;
     } catch (err) {
@@ -310,18 +409,19 @@ export function useDeviceEncryption(userId: string | undefined) {
     }
   }, [userId, fetchDevices]);
 
-  // Disable device encryption (revoke current device)
   const disableEncryption = useCallback(async () => {
     if (!userId || !currentDeviceId) return false;
 
     try {
       await supabase
-        .from('user_devices' as any)
-        .update({ is_active: false } as any)
+        .from('user_devices')
+        .update({ is_active: false })
         .eq('id', currentDeviceId);
 
       await clearStoredKeys();
-      setKeys(null);
+      setPrivateKey(null);
+      setPublicKeyJwk(null);
+      setFingerprint(null);
       setIsEnabled(false);
       setIsReady(false);
       setCurrentDeviceId(null);
@@ -333,21 +433,21 @@ export function useDeviceEncryption(userId: string | undefined) {
     }
   }, [userId, currentDeviceId, fetchDevices]);
 
-  // Revoke a specific device
   const revokeDevice = useCallback(async (deviceId: string) => {
     if (!userId) return false;
 
     try {
       await supabase
-        .from('user_devices' as any)
-        .update({ is_active: false } as any)
+        .from('user_devices')
+        .update({ is_active: false })
         .eq('id', deviceId)
         .eq('user_id', userId);
 
-      // If revoking current device, clear local keys
       if (deviceId === currentDeviceId) {
         await clearStoredKeys();
-        setKeys(null);
+        setPrivateKey(null);
+        setPublicKeyJwk(null);
+        setFingerprint(null);
         setIsEnabled(false);
         setIsReady(false);
         setCurrentDeviceId(null);
@@ -361,32 +461,58 @@ export function useDeviceEncryption(userId: string | undefined) {
     }
   }, [userId, currentDeviceId, fetchDevices]);
 
-  // Encrypt message using current device keys
-  const encrypt = useCallback(async (message: string): Promise<string> => {
-    if (!keys || !isReady) return message;
+  /**
+   * Encrypt message for current device only.
+   * Returns DeviceEncryptedPayload to be stored in device_encrypted_content.
+   */
+  const encrypt = useCallback(async (message: string): Promise<DeviceEncryptedPayload | null> => {
+    if (!privateKey || !publicKeyJwk || !currentDeviceId || !fingerprint || !isReady) return null;
     try {
-      return await encryptWithDeviceKey(message, keys.privateKey, keys.publicKey);
-    } catch {
-      return message;
+      return await encryptForDevice(
+        message,
+        privateKey,
+        publicKeyJwk,
+        currentDeviceId,
+        fingerprint,
+        currentDeviceId,
+      );
+    } catch (err) {
+      console.error('Device encryption failed:', err);
+      return null;
     }
-  }, [keys, isReady]);
+  }, [privateKey, publicKeyJwk, currentDeviceId, fingerprint, isReady]);
 
-  // Decrypt message
-  const decrypt = useCallback(async (encryptedMessage: string): Promise<string> => {
-    if (!keys || !isReady) {
-      if (isDeviceEncrypted(encryptedMessage)) {
-        return '[🔒 Không thể giải mã - thiết bị không có quyền]';
+  /**
+   * Decrypt a device-encrypted message.
+   * Returns null if this device cannot decrypt (wrong device).
+   */
+  const decrypt = useCallback(async (payload: DeviceEncryptedPayload, senderPublicKey?: string): Promise<string | null> => {
+    if (!privateKey || !isReady || !currentDeviceId) return null;
+
+    // Check if this message is for this device
+    if (payload.device_id !== currentDeviceId && payload.sender_device_id !== currentDeviceId) {
+      return null; // Not for this device
+    }
+
+    try {
+      // We need the sender's public key to derive the shared secret
+      // If sender is us (same device), use our own public key
+      let senderPubKeyJwk: JsonWebKey;
+      if (payload.sender_device_id === currentDeviceId) {
+        // We sent this message - use our own public key
+        senderPubKeyJwk = publicKeyJwk!;
+      } else if (senderPublicKey) {
+        senderPubKeyJwk = JSON.parse(senderPublicKey);
+      } else {
+        return null;
       }
-      return encryptedMessage;
-    }
-    if (!isDeviceEncrypted(encryptedMessage)) return encryptedMessage;
 
-    try {
-      return await decryptWithDeviceKey(encryptedMessage, keys.privateKey, keys.publicKey);
-    } catch {
-      return '[🔒 Không thể giải mã tin nhắn]';
+      return await decryptDeviceMessage(payload, privateKey, senderPubKeyJwk);
+    } catch (err) {
+      console.error('Device decryption failed:', err);
+      return null;
     }
-  }, [keys, isReady]);
+  }, [privateKey, publicKeyJwk, currentDeviceId, isReady]);
 
   return {
     isEnabled,
@@ -394,6 +520,8 @@ export function useDeviceEncryption(userId: string | undefined) {
     loading,
     devices,
     currentDeviceId,
+    fingerprint,
+    publicKeyJwk,
     enableEncryption,
     disableEncryption,
     revokeDevice,
