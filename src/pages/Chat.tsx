@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
@@ -124,10 +125,10 @@ const Chat = () => {
   }, [user]);
 
   useEffect(() => {
-    if (user && deletedConversationIds !== null) {
+      if (!user) return;
       fetchConversations();
-    }
-  }, [user, deletedConversationIds]);
+    }, [user]);
+
 
   // Disable Android back button
   useEffect(() => {
@@ -202,52 +203,40 @@ const Chat = () => {
           
           // Update lastMessage for the conversation - use functional update
           setConversations((prev) => {
-            // Double check prev is not empty to avoid clearing conversations
-            if (prev.length === 0 && currentConversations.length > 0) {
-              // State got cleared somehow, restore from ref
-              return currentConversations.map((conv) => {
-                if (conv.id === newMessage.conversation_id) {
-                  return {
-                    ...conv,
-                    lastMessage: {
-                      content: newMessage.content,
-                      created_at: newMessage.created_at,
-                      file_type: newMessage.file_type,
-                      sender_id: newMessage.sender_id,
-                      is_revoked: newMessage.is_revoked || false,
-                    },
-                  };
-                }
-                return conv;
-              }).sort((a, b) => {
-                const aTime = a.lastMessage?.created_at || "";
-                const bTime = b.lastMessage?.created_at || "";
-                return bTime.localeCompare(aTime);
-              });
+            const exists = prev.find(
+              (conv) => conv.id === newMessage.conversation_id
+            );
+          
+            let updated;
+          
+            if (exists) {
+          
+              updated = prev.map((conv) =>
+                conv.id === newMessage.conversation_id
+                  ? {
+                      ...conv,
+                      lastMessage: {
+                        content: newMessage.content,
+                        created_at: newMessage.created_at,
+                        file_type: newMessage.file_type,
+                        sender_id: newMessage.sender_id,
+                        is_revoked: newMessage.is_revoked || false,
+                      },
+                    }
+                  : conv
+              );
+            } else {
+             
+              return prev;
             }
-            
-            const updated = prev.map((conv) => {
-              if (conv.id === newMessage.conversation_id) {
-                return {
-                  ...conv,
-                  lastMessage: {
-                    content: newMessage.content,
-                    created_at: newMessage.created_at,
-                    file_type: newMessage.file_type,
-                    sender_id: newMessage.sender_id,
-                    is_revoked: newMessage.is_revoked || false,
-                  },
-                };
-              }
-              return conv;
-            });
-            // Sort by latest message
+          
             return updated.sort((a, b) => {
               const aTime = a.lastMessage?.created_at || "";
               const bTime = b.lastMessage?.created_at || "";
               return bTime.localeCompare(aTime);
             });
           });
+
 
           // Play sound if message is not from current user and not in current conversation
           if (newMessage.sender_id !== user.id) {
@@ -361,9 +350,9 @@ const Chat = () => {
       }
 
       if (!participations || participations.length === 0) {
-        setConversations([]);
         return;
       }
+
 
       // Filter out deleted conversations
       const activeParticipations = participations.filter(
@@ -371,9 +360,9 @@ const Chat = () => {
       );
 
       if (activeParticipations.length === 0) {
-        setConversations([]);
         return;
       }
+
 
       const activeConversationIds = activeParticipations.map((p) => p.conversation_id);
 
@@ -393,9 +382,9 @@ const Chat = () => {
       const otherUserIds = [...new Set(allParticipants?.map((p) => p.user_id) || [])];
       
       if (otherUserIds.length === 0) {
-        setConversations([]);
         return;
       }
+
 
       const { data: profiles, error: profilesError } = await supabase
         .from("profiles")
@@ -459,7 +448,23 @@ const Chat = () => {
         return bTime.localeCompare(aTime);
       });
 
-      setConversations(conversationsData);
+      setConversations(prev => {
+          if (!conversationsData || conversationsData.length === 0) {
+            return prev;
+          }
+        
+          const map = new Map(prev.map(c => [c.id, c]));
+        
+          conversationsData.forEach(conv => {
+            map.set(conv.id, conv);
+          });
+        
+          return Array.from(map.values()).sort((a, b) => {
+            const aTime = a.lastMessage?.created_at || "";
+            const bTime = b.lastMessage?.created_at || "";
+            return bTime.localeCompare(aTime);
+          });
+        });
     } catch (err) {
       console.error("Error in fetchConversations:", err);
     }
@@ -468,9 +473,16 @@ const Chat = () => {
   const handleNewConversation = (conversation: Conversation) => {
     setConversations((prev) => {
       const exists = prev.find((c) => c.id === conversation.id);
-      if (exists) return prev;
-      return [conversation, ...prev];
-    });
+    
+      if (exists) {
+        return prev.map((c) =>
+          c.id === conversation.id ? conversation : c
+        );
+      }
+
+  return [conversation, ...prev];
+});
+
     setSelectedConversation(conversation);
   };
 

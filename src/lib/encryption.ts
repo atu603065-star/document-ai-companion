@@ -308,17 +308,27 @@ export const encryptForConversation = async (
 // Simple message decryption for E2E
 export const decryptForConversation = async (
   encryptedString: string,
-  conversationKeyBase64: string
+  conversationKeyBase64: string | null
 ): Promise<string> => {
   try {
+    if (!conversationKeyBase64) {
+      return "[Không thể giải mã]";
+    }
+
+    if (!isEncryptedMessage(encryptedString)) {
+      return encryptedString;
+    }
+
     const encryptedData: EncryptedData = JSON.parse(encryptedString);
     const key = await importSymmetricKey(conversationKeyBase64);
+
     return await decryptMessage(encryptedData, key);
-  } catch {
-    // Return original if decryption fails (unencrypted message)
-    return encryptedString;
+  } catch (err) {
+    console.error("Decrypt failed:", err);
+    return "[Không thể giải mã]";
   }
 };
+
 
 // Check if a message is encrypted (simple heuristic)
 export const isEncryptedMessage = (content: string): boolean => {
