@@ -8,6 +8,7 @@ import { useNotificationSound } from "@/hooks/useNotificationSound";
 import { useVoiceCall } from "@/hooks/useVoiceCall";
 import { useSignalProtocol } from "@/hooks/useSignalProtocol";
 import { useE2EEncryption } from "@/hooks/useE2EEncryption";
+import { useDeviceEncryption, DeviceEncryptedPayload } from "@/hooks/useDeviceEncryption";
 import { sanitizeInput, isAllowedFileType } from "@/lib/security";
 import { isEncryptedMessage } from "@/lib/encryption";
 import { Button } from "@/components/ui/button";
@@ -62,6 +63,8 @@ interface Message {
   deleted_for_user_ids: string[];
   type: string;
   reply_to_id?: string | null;
+  sender_device_id?: string | null;
+  device_encrypted_content?: DeviceEncryptedPayload | null;
 }
 
 interface UploadingMessage {
@@ -189,6 +192,15 @@ export const ChatArea = ({
 
   // Combined encryption state
   const isEncryptionActive = e2eEnabled && (isSignalReady || isE2EActive);
+
+  // Device encryption hook
+  const {
+    isEnabled: deviceEncEnabled,
+    isReady: deviceEncReady,
+    currentDeviceId: myDeviceId,
+    encrypt: deviceEncrypt,
+    decrypt: deviceDecrypt,
+  } = useDeviceEncryption(currentUser.id);
   // Use voice call props from parent if available, otherwise use local hook
   const localVoiceCall = useVoiceCall(voiceCallProps ? undefined : currentUser.id);
   
@@ -461,8 +473,18 @@ export const ChatArea = ({
     setSelectedFile(null);
     setReplyTo(null);
 
-    // Encrypt message - prefer Signal Protocol, fallback to legacy
-    if (messageContent && isEncryptionActive) {
+    // Device encryption: encrypt content for this device only
+    let deviceEncPayload: DeviceEncryptedPayload | null = null;
+    if (messageContent && deviceEncEnabled && deviceEncReady) {
+      try {
+        deviceEncPayload = await deviceEncrypt(messageContent);
+      } catch (err) {
+        console.error("Device encryption failed:", err);
+      }
+    }
+
+    // E2E encryption - prefer Signal Protocol, fallback to legacy
+    if (messageContent && isEncryptionActive && !deviceEncPayload) {
       try {
         if (isSignalReady) {
           messageContent = await signalEncrypt(messageContent);
@@ -480,23 +502,37 @@ export const ChatArea = ({
       }
     }
 
+    // Build message insert object
+    const msgInsert: any = {
+      conversation_id: conversation.id,
+      sender_id: currentUser.id,
+      type: "text",
+      reply_to_id: currentReplyTo?.id || null,
+    };
+
+    if (deviceEncPayload) {
+      // Store device-encrypted content - content field stores a placeholder
+      msgInsert.content = "[🔒 Device Encrypted]";
+      msgInsert.device_encrypted_content = deviceEncPayload;
+      msgInsert.sender_device_id = myDeviceId;
+    } else {
+      msgInsert.content = messageContent;
+    }
+
     if (fileToUpload) {
       // Upload in background
       const fileData = await uploadFileWithProgress(fileToUpload);
       
       if (fileData) {
-        const msgType = fileData.type.startsWith("image/") ? "image" : "file";
+        msgInsert.type = fileData.type.startsWith("image/") ? "image" : "file";
+        msgInsert.file_url = fileData.url;
+        msgInsert.file_name = fileData.name;
+        msgInsert.file_type = fileData.type;
+        if (!deviceEncPayload) {
+          msgInsert.content = messageContent || null;
+        }
         
-        const { error } = await supabase.from("messages").insert({
-          conversation_id: conversation.id,
-          sender_id: currentUser.id,
-          content: messageContent || null,
-          file_url: fileData.url,
-          file_name: fileData.name,
-          file_type: fileData.type,
-          type: msgType,
-          reply_to_id: currentReplyTo?.id || null,
-        });
+        const { error } = await supabase.from("messages").insert(msgInsert);
 
         if (error) {
           toast({
@@ -507,20 +543,13 @@ export const ChatArea = ({
           return;
         }
         
-        // Delay onMessageSent to avoid race condition with realtime
         setTimeout(() => onMessageSent(), 300);
       }
-    } else if (messageContent) {
+    } else if (messageContent || deviceEncPayload) {
       setIsSending(true);
       
       try {
-        const { error } = await supabase.from("messages").insert({
-          conversation_id: conversation.id,
-          sender_id: currentUser.id,
-          content: messageContent,
-          type: "text",
-          reply_to_id: currentReplyTo?.id || null,
-        });
+        const { error } = await supabase.from("messages").insert(msgInsert);
 
         if (error) {
           toast({
@@ -531,7 +560,6 @@ export const ChatArea = ({
           return;
         }
 
-        // Delay onMessageSent to avoid race condition with realtime
         setTimeout(() => onMessageSent(), 300);
       } catch {
         toast({
@@ -785,23 +813,45 @@ export const ChatArea = ({
       const newDecrypted: Record<string, string> = {};
       
       for (const msg of visibleMessages) {
+        // Handle device-encrypted messages first
+        if (msg.device_encrypted_content) {
+          const payload = msg.device_encrypted_content as DeviceEncryptedPayload;
+          if (deviceEncReady && myDeviceId) {
+            // Check if this message is for this device
+            if (payload.device_id === myDeviceId || payload.sender_device_id === myDeviceId) {
+              try {
+                const decrypted = await deviceDecrypt(payload);
+                if (decrypted) {
+                  newDecrypted[msg.id] = decrypted;
+                } else {
+                  newDecrypted[msg.id] = '🔒 Mã hoá cho thiết bị khác';
+                }
+              } catch {
+                newDecrypted[msg.id] = '🔒 Không thể giải mã';
+              }
+            } else {
+              newDecrypted[msg.id] = '🔒 Mã hoá cho thiết bị khác';
+            }
+          } else {
+            newDecrypted[msg.id] = '🔒 Mã hoá cho thiết bị khác';
+          }
+          continue;
+        }
+
         if (msg.content) {
           // Check if message is encrypted
           const isSignalMsg = isSignalMessage(msg.content);
           const isLegacyEncrypted = isEncryptedMessage(msg.content);
           
           if (!isSignalMsg && !isLegacyEncrypted) {
-            // Plain text message - no decryption needed
             continue;
           }
           
-          // If encryption is not active, show lock icon for encrypted messages
           if (!isEncryptionActive) {
             newDecrypted[msg.id] = '🔒 Tin nhắn đã mã hoá';
             continue;
           }
           
-          // Try Signal Protocol first
           if (isSignalReady && isSignalMsg) {
             try {
               const decrypted = await signalDecrypt(msg.content);
@@ -809,9 +859,7 @@ export const ChatArea = ({
             } catch {
               newDecrypted[msg.id] = '🔒 Không thể giải mã';
             }
-          }
-          // Fallback to legacy E2E encryption
-          else if (isE2EActive && isLegacyEncrypted) {
+          } else if (isE2EActive && isLegacyEncrypted) {
             try {
               const decrypted = await legacyDecrypt(msg.content);
               newDecrypted[msg.id] = decrypted;
@@ -828,12 +876,15 @@ export const ChatArea = ({
     };
 
     decryptAllMessages();
-  }, [visibleMessages.length, isEncryptionActive, isSignalReady, isE2EActive, signalDecrypt, legacyDecrypt, isSignalMessage]);
+  }, [visibleMessages.length, isEncryptionActive, isSignalReady, isE2EActive, deviceEncReady, myDeviceId, signalDecrypt, legacyDecrypt, deviceDecrypt, isSignalMessage]);
 
   // Get display content for a message (decrypted if available)
   const getDisplayContent = useCallback((msg: Message): string | null => {
     if (!msg.content) return null;
+    // If we have a decrypted version, use it
     if (decryptedContents[msg.id]) return decryptedContents[msg.id];
+    // Device-encrypted message placeholder
+    if (msg.device_encrypted_content) return '[🔒 Đang giải mã...]';
     if (isSignalMessage(msg.content) || isEncryptedMessage(msg.content)) return '[Đang giải mã...]';
     return msg.content;
   }, [decryptedContents, isSignalMessage]);
