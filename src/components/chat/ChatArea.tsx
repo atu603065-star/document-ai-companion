@@ -563,8 +563,10 @@ export const ChatArea = ({
           });
           return;
         }
-
+        
         setTimeout(() => onMessageSent(), 300);
+        // Send push notification
+        onSendPushNotification?.(conversation.id, conversation.participant.username, messageContent || "Tin nhắn mới");
       } catch {
         toast({
           variant: "destructive",
