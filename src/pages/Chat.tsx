@@ -12,6 +12,7 @@ import { useIsMobile } from "@/hooks/use-mobile";
 import { useTheme } from "@/hooks/useTheme";
 import { useNotificationSound } from "@/hooks/useNotificationSound";
 import { useVoiceCall } from "@/hooks/useVoiceCall";
+import { usePushNotifications } from "@/hooks/usePushNotifications";
 import { Loader2 } from "lucide-react";
 
 export interface Conversation {
