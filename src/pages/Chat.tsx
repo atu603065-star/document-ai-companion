@@ -58,6 +58,7 @@ const Chat = () => {
   const conversationIds = conversations.map((c) => c.id);
   const { unreadCounts, markAsRead, refetch: refetchUnread } = useUnreadMessages(user?.id, conversationIds);
   const { playSound } = useNotificationSound(user?.id);
+  const { sendPushNotification } = usePushNotifications(user?.id);
   
   // Voice call at page level - so calls can be received from mobile sidebar
   const {
