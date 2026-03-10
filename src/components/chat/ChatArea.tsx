@@ -107,6 +107,7 @@ interface ChatAreaProps {
   onBack?: () => void;
   showBackButton?: boolean;
   voiceCallProps?: VoiceCallProps;
+  onSendPushNotification?: (conversationId: string, senderName: string, content: string) => void;
 }
 
 export const ChatArea = ({
@@ -116,6 +117,7 @@ export const ChatArea = ({
   onBack,
   showBackButton = false,
   voiceCallProps,
+  onSendPushNotification,
 }: ChatAreaProps) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState("");
