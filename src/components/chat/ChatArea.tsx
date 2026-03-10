@@ -633,6 +633,8 @@ export const ChatArea = ({
     setNewMessage("");
     setReplyTo(null);
     onMessageSent();
+    // Send push for storage file
+    onSendPushNotification?.(conversation.id, conversation.participant.username, file.file_name || "Tệp đính kèm");
   };
 
   const handleContextMenu = useCallback(
