@@ -107,6 +107,7 @@ interface ChatAreaProps {
   onBack?: () => void;
   showBackButton?: boolean;
   voiceCallProps?: VoiceCallProps;
+  onSendPushNotification?: (conversationId: string, senderName: string, content: string) => void;
 }
 
 export const ChatArea = ({
@@ -116,6 +117,7 @@ export const ChatArea = ({
   onBack,
   showBackButton = false,
   voiceCallProps,
+  onSendPushNotification,
 }: ChatAreaProps) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState("");
@@ -544,6 +546,8 @@ export const ChatArea = ({
         }
         
         setTimeout(() => onMessageSent(), 300);
+        // Send push notification to recipient
+        onSendPushNotification?.(conversation.id, conversation.participant.username, messageContent || "[File]");
       }
     } else if (messageContent || deviceEncPayload) {
       setIsSending(true);
@@ -559,8 +563,10 @@ export const ChatArea = ({
           });
           return;
         }
-
+        
         setTimeout(() => onMessageSent(), 300);
+        // Send push notification
+        onSendPushNotification?.(conversation.id, conversation.participant.username, messageContent || "Tin nhắn mới");
       } catch {
         toast({
           variant: "destructive",
@@ -627,6 +633,8 @@ export const ChatArea = ({
     setNewMessage("");
     setReplyTo(null);
     onMessageSent();
+    // Send push for storage file
+    onSendPushNotification?.(conversation.id, conversation.participant.username, file.file_name || "Tệp đính kèm");
   };
 
   const handleContextMenu = useCallback(

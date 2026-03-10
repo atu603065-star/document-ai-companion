@@ -12,6 +12,7 @@ import { useIsMobile } from "@/hooks/use-mobile";
 import { useTheme } from "@/hooks/useTheme";
 import { useNotificationSound } from "@/hooks/useNotificationSound";
 import { useVoiceCall } from "@/hooks/useVoiceCall";
+import { usePushNotifications } from "@/hooks/usePushNotifications";
 import { Loader2 } from "lucide-react";
 
 export interface Conversation {
@@ -57,6 +58,7 @@ const Chat = () => {
   const conversationIds = conversations.map((c) => c.id);
   const { unreadCounts, markAsRead, refetch: refetchUnread } = useUnreadMessages(user?.id, conversationIds);
   const { playSound } = useNotificationSound(user?.id);
+  const { sendPushNotification } = usePushNotifications(user?.id);
   
   // Voice call at page level - so calls can be received from mobile sidebar
   const {
@@ -552,6 +554,7 @@ const Chat = () => {
               endCall,
               toggleMute,
             }}
+            onSendPushNotification={sendPushNotification}
           />
         ) : (
           <>
@@ -623,6 +626,7 @@ const Chat = () => {
               endCall,
               toggleMute,
             }}
+            onSendPushNotification={sendPushNotification}
           />
         ) : (
           <EmptyState />
