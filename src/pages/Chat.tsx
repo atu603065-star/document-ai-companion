@@ -626,6 +626,7 @@ const Chat = () => {
               endCall,
               toggleMute,
             }}
+            onSendPushNotification={sendPushNotification}
           />
         ) : (
           <EmptyState />
