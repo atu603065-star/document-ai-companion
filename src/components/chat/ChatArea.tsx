@@ -546,6 +546,8 @@ export const ChatArea = ({
         }
         
         setTimeout(() => onMessageSent(), 300);
+        // Send push notification to recipient
+        onSendPushNotification?.(conversation.id, conversation.participant.username, messageContent || "[File]");
       }
     } else if (messageContent || deviceEncPayload) {
       setIsSending(true);
